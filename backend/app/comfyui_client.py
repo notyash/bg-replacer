@@ -141,9 +141,24 @@ class ComfyUIClient:
                 history = json.loads(resp.read())
 
             if prompt_id in history:
-                outputs = history[prompt_id]["outputs"]
+                prompt_data = history[prompt_id]
+                outputs = prompt_data.get("outputs", {})
                 if output_node_id in outputs and "images" in outputs[output_node_id]:
                     return outputs[output_node_id]["images"]
+                
+                # Job is completed in history, but expected output node images were not found.
+                # This indicates execution failed or was aborted before reaching the output node.
+                status_info = prompt_data.get("status", {})
+                messages = status_info.get("messages", [])
+                err_details = ""
+                for msg in messages:
+                    if isinstance(msg, list) and len(msg) >= 2 and msg[0] == "execution_error":
+                        err_details = f": {msg[1]}"
+                
+                raise RuntimeError(
+                    f"ComfyUI job completed without producing the expected output image{err_details}. "
+                    f"Please check ComfyUI server logs for details."
+                )
 
             time.sleep(poll_interval)
 

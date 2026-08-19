@@ -15,9 +15,13 @@ directly into the ComfyUI workflow JSON.
 
 import os
 import json
-import google.generativeai as genai
+import logging
+from google import genai
+from google.genai import types
 
-GEMINI_MODEL = "gemini-2.0-flash"  # fast + free-tier friendly; swap if needed
+logger = logging.getLogger(__name__)
+
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 
 ANALYSIS_PROMPT = """
 You are configuring an AI background-replacement pipeline (ComfyUI).
@@ -37,6 +41,11 @@ fields:
     // backdrop's light is likely bleeding onto the subject's edge
     // pixels (rim light / color spill). false for photos already
     // shot in a real environment (outdoors, room, car, etc).
+
+  "reflective_surface_detected": true | false,
+    // true if the subject is wearing glasses, sunglasses, a helmet with a visor,
+    // or holding/standing near glass or other highly reflective surfaces that can
+    // affect matting/segmentation mask quality. false otherwise.
 
   "lighting_direction": "front" | "side" | "back" | "top" | "diffuse",
     // dominant apparent light direction on the subject's face/body.
@@ -73,21 +82,45 @@ def analyze(image_path: str, api_key: str | None = None) -> dict:
     if not api_key:
         raise RuntimeError("Set GEMINI_API_KEY env var or pass api_key=")
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=60_000)
+    )
 
     with open(image_path, "rb") as f:
         image_bytes = f.read()
 
     mime_type = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
 
-    response = model.generate_content(
-        [
-            ANALYSIS_PROMPT,
-            {"mime_type": mime_type, "data": image_bytes},
-        ],
-        generation_config={"temperature": 0.2},
-    )
+    import time
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    ANALYSIS_PROMPT,
+                    types.Part.from_bytes(
+                        data=image_bytes,
+                        mime_type=mime_type
+                    ),
+                ],
+                config=types.GenerateContentConfig(temperature=0.2),
+            )
+            break
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise e
+            err_msg = str(e).lower()
+            if any(x in err_msg for x in ["504", "503", "502", "429", "deadline", "timeout", "timed out", "read operation timed out"]):
+                sleep_time = 2 * (attempt + 1)
+                logger.warning(
+                    f"Gemini API warning: request failed on attempt {attempt+1} due to transient error: {e}. "
+                    f"Retrying in {sleep_time}s..."
+                )
+                time.sleep(sleep_time)
+            else:
+                raise e
 
     raw = response.text.strip()
     # Gemini sometimes wraps JSON in ```json fences even when asked not to

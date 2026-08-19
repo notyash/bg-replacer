@@ -17,9 +17,13 @@ encoding everything we learned by hand tonight:
 
 import os
 import json
-import google.generativeai as genai
+import logging
+from google import genai
+from google.genai import types
 
-GEMINI_MODEL = "gemini-2.0-flash"
+logger = logging.getLogger(__name__)
+
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 
 BASE_NEGATIVE = (
     "person, people, human, man, woman, figure, silhouette, face, "
@@ -75,15 +79,39 @@ def expand(user_request: str, lighting_fragment: str, api_key: str | None = None
     if not api_key:
         raise RuntimeError("Set GEMINI_API_KEY env var or pass api_key=")
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=60_000)
+    )
 
     prompt = EXPANSION_PROMPT_TEMPLATE.format(
         user_request=user_request,
         lighting_fragment=lighting_fragment,
     )
 
-    response = model.generate_content(prompt, generation_config={"temperature": 0.7})
+    import time
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.7),
+            )
+            break
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise e
+            err_msg = str(e).lower()
+            if any(x in err_msg for x in ["504", "503", "502", "429", "deadline", "timeout", "timed out", "read operation timed out"]):
+                sleep_time = 2 * (attempt + 1)
+                logger.warning(
+                    f"Gemini API warning: request failed on attempt {attempt+1} due to transient error: {e}. "
+                    f"Retrying in {sleep_time}s..."
+                )
+                time.sleep(sleep_time)
+            else:
+                raise e
 
     raw = response.text.strip()
     if raw.startswith("```"):
